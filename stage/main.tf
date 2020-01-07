@@ -3,31 +3,19 @@ provider "aws" {
   region = var.aws_region
 }
 
-resource "aws_kms_key" "parameter_store" {
-  description             = "Parameter store kms master key"
-  deletion_window_in_days = 10
-  enable_key_rotation     = true
-}
+### Global State
 
-resource "aws_kms_alias" "parameter_store_alias" {
-  name          = "alias/parameter_store_key"
-  target_key_id = aws_kms_key.parameter_store.id
-}
+data "terraform_remote_state" "global" {
+  backend = "s3"
 
-# aws_ecr_repository.ecr:
-resource "aws_ecr_repository" "ecr" {
-  image_tag_mutability = "IMMUTABLE"
-  name                 = "mychoir/song-picker"
-  tags = {
-    Environment = "prod"
+  config = {
+    bucket = "terraform-white-plains-nac-state" 
+    key    = "global/s3/terraform.tfstate"
+    region = "us-east-1"
   }
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  timeouts {}
 }
+
+###  IAM
 
 # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html
 resource "aws_iam_role" "ecsTaskExecutionRole" {
@@ -49,6 +37,44 @@ data "aws_iam_policy_document" "assume_role_policy" {
 resource "aws_iam_role_policy_attachment" "ecsTaskExecutionRole_policy" {
   role       = aws_iam_role.ecsTaskExecutionRole.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+### Route53
+
+resource "aws_route53_zone" "dev" {
+  name          = "dev.mychoir.info"
+  force_destroy = false
+
+  tags = {
+    Environment = "dev"
+  }
+}
+
+resource "aws_route53_record" "dev-ns" {
+  zone_id = data.terraform_remote_state.global.outputs.route53_zone_main.zone_id
+  name    = "dev.mychoir.info"
+  type    = "NS"
+  ttl     = "30"
+
+  records = [
+    aws_route53_zone.dev.name_servers.0,
+    aws_route53_zone.dev.name_servers.1,
+    aws_route53_zone.dev.name_servers.2,
+    aws_route53_zone.dev.name_servers.3
+  ]
+}
+
+resource "aws_route53_record" "dev" {
+  allow_overwrite = true
+  zone_id         = aws_route53_zone.dev.zone_id
+  name            = aws_route53_zone.dev.name
+  type            = "A"
+
+  alias {
+    name                   = aws_alb.main.dns_name
+    zone_id                = aws_alb.main.zone_id
+    evaluate_target_health = true
+  }
 }
 
 ### Network
@@ -168,78 +194,6 @@ resource "aws_security_group" "ecs_tasks" {
   }
 }
 
-# aws_route53_zone.main:
-resource "aws_route53_zone" "main" {
-  comment       = "Managed by Terraform"
-  force_destroy = false
-  name          = "mychoir.info."
-  tags = {
-    Environment = "prod"
-  }
-}
-
-resource "aws_route53_zone" "dev" {
-  name          = "dev.mychoir.info"
-  force_destroy = false
-
-  tags = {
-    Environment = "dev"
-  }
-}
-
-resource "aws_route53_record" "dev-ns" {
-  zone_id = aws_route53_zone.main.zone_id
-  name    = "dev.mychoir.info"
-  type    = "NS"
-  ttl     = "30"
-
-  records = [
-    aws_route53_zone.dev.name_servers.0,
-    aws_route53_zone.dev.name_servers.1,
-    aws_route53_zone.dev.name_servers.2,
-    aws_route53_zone.dev.name_servers.3
-  ]
-}
-
-resource "aws_route53_record" "dev" {
-  allow_overwrite = true
-  zone_id         = aws_route53_zone.dev.zone_id
-  name            = aws_route53_zone.dev.name
-  type            = "A"
-
-  alias {
-    name                   = aws_alb.main.dns_name
-    zone_id                = aws_alb.main.zone_id
-    evaluate_target_health = true
-  }
-}
-
-resource "aws_route53_record" "prod" {
-  allow_overwrite = true
-  zone_id         = aws_route53_zone.main.zone_id
-  name            = aws_route53_zone.main.name
-  type            = "A"
-
-  alias {
-    name                   = aws_alb.main.dns_name
-    zone_id                = aws_alb.main.zone_id
-    evaluate_target_health = true
-  }
-}
-
-resource "aws_route53_record" "www" {
-  allow_overwrite = true
-  zone_id         = aws_route53_zone.main.zone_id
-  name            = "www.${aws_route53_zone.main.name}"
-  type            = "A"
-
-  alias {
-    name                   = aws_alb.main.dns_name
-    zone_id                = aws_alb.main.zone_id
-    evaluate_target_health = true
-  }
-}
-
 ### ALB
 
 resource "aws_alb" "main" {
@@ -323,3 +277,12 @@ resource "aws_ecs_service" "main" {
   depends_on = [aws_alb_listener.front_end]
 }
 
+terraform {
+  backend "s3" {
+    bucket         = "terraform-white-plains-nac-state"
+    key            = "stage/s3/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "terraform-white-plains-nac-locks"
+    encrypt        = true
+  }
+}
